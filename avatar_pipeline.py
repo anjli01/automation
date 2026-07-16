@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+Avatar Pipeline — Automated AI Colleague Video Generator
+
+End-to-end automation:
+  1. Generate common AI virtual colleague phrases using Gemini or Claude Haiku
+  2. Create avatar videos using Azure Batch Avatar Synthesis API
+  3. Download the finished MP4 videos to a local folder
+
+Usage:
+  python avatar_pipeline.py                          # Full pipeline (Gemini, 10 phrases)
+  python avatar_pipeline.py --llm haiku              # Use Claude Haiku instead
+  python avatar_pipeline.py --num-phrases 5          # Generate 5 phrases
+  python avatar_pipeline.py --dry-run                # Generate phrases only, skip Azure
+  python avatar_pipeline.py --mode combined          # All phrases in one video
+  python avatar_pipeline.py --output-dir ./my_vids   # Custom output directory
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import requests
+from anthropic import Anthropic
+from dotenv import load_dotenv
+
+# ──────────────────────────────────────────────
+# Constants & Defaults
+# ──────────────────────────────────────────────
+DEFAULT_NUM_PHRASES = 10
+DEFAULT_AVATAR_CHARACTER = "lisa"
+DEFAULT_AVATAR_STYLE = "graceful-standing"
+DEFAULT_VOICE = "en-US-JennyMultilingualNeural"
+DEFAULT_OUTPUT_DIR = Path(__file__).parent / "avatar_videos"
+DEFAULT_POLL_INTERVAL = 10  # seconds
+AZURE_API_VERSION = "2024-08-01"
+
+HAIKU_MODEL = "claude-3-5-haiku-20241022"
+GEMINI_MODEL = "gemini-2.0-flash"
+
+# ──────────────────────────────────────────────
+# Stage 1: Generate Phrases (Gemini or Haiku)
+# ──────────────────────────────────────────────
+
+def _build_phrase_prompt(num_phrases: int) -> str:
+    """Build the shared prompt for phrase generation."""
+    return f"""You are helping build an AI virtual colleague avatar. 
+Generate exactly {num_phrases} common phrases that an AI virtual colleague would say to users in a professional workplace setting.
+
+Cover a variety of categories such as:
+- Greetings (morning, afternoon, welcome back)
+- Meeting-related (reminders, joining, wrapping up)
+- Task assistance (offering help, status updates, task completion)
+- Encouragement and motivation
+- Sign-offs and end-of-day messages
+- Casual friendly interactions
+
+Requirements:
+- Each phrase should be 1-3 sentences long
+- Sound natural, warm, and professional — not robotic
+- Suitable for text-to-speech avatar video
+
+Return ONLY a valid JSON array with objects having "category" and "phrase" keys.
+Example format:
+[
+  {{"category": "greeting", "phrase": "Good morning! I hope you had a great start to your day. Let me know if there's anything I can help you with."}},
+  {{"category": "meeting", "phrase": "Just a friendly reminder — your team standup starts in 10 minutes. I've got your notes ready if you need them."}}
+]
+
+Generate exactly {num_phrases} phrases. Return ONLY the JSON array, no extra text."""
+
+
+def _parse_phrases(raw_text: str, source: str) -> list[dict]:
+    """Parse JSON array of phrases from LLM response text."""
+    json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+    if not json_match:
+        print(f"  ⚠ Could not parse JSON from {source} response. Raw output:")
+        print(f"  {raw_text[:500]}")
+        sys.exit(1)
+    return json.loads(json_match.group())
+
+
+def generate_phrases_gemini(num_phrases: int) -> list[dict]:
+    """
+    Call Google Gemini to generate common AI virtual colleague phrases.
+
+    Returns a list of dicts: [{"category": "...", "phrase": "..."}, ...]
+    """
+    from google import genai
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("\n  ❌ Missing GEMINI_API_KEY in .env file!")
+        print("     Get one at: https://aistudio.google.com/apikey")
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    prompt = _build_phrase_prompt(num_phrases)
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+
+    raw_text = response.text.strip()
+    phrases = _parse_phrases(raw_text, "Gemini")
+    return phrases
+
+
+def generate_phrases_haiku(num_phrases: int) -> list[dict]:
+    """
+    Call Claude Haiku to generate common AI virtual colleague phrases.
+
+    Returns a list of dicts: [{"category": "...", "phrase": "..."}, ...]
+    """
+    client = Anthropic()
+    prompt = _build_phrase_prompt(num_phrases)
+
+    message = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw_text = message.content[0].text.strip()
+    phrases = _parse_phrases(raw_text, "Haiku")
+    return phrases
+
+
+def generate_phrases(num_phrases: int, llm: str = "gemini") -> list[dict]:
+    """
+    Generate phrases using the selected LLM.
+
+    Args:
+        num_phrases: Number of phrases to generate (1-10)
+        llm: Which LLM to use — 'gemini' or 'haiku'
+    """
+    print(f"\n{'='*60}")
+    print(f"  STAGE 1: Generating {num_phrases} phrases with {llm.capitalize()}")
+    print(f"{'='*60}\n")
+
+    if llm == "haiku":
+        phrases = generate_phrases_haiku(num_phrases)
+    else:
+        phrases = generate_phrases_gemini(num_phrases)
+
+    print(f"  ✅ Generated {len(phrases)} phrases:\n")
+    for i, p in enumerate(phrases, 1):
+        print(f"  {i:>2}. [{p['category']}] {p['phrase'][:80]}{'...' if len(p['phrase']) > 80 else ''}")
+
+    return phrases
+
+
+def save_phrases(phrases: list[dict], output_dir: Path) -> Path:
+    """Save generated phrases to a JSON file for traceability."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filepath = output_dir / "phrases.json"
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(phrases, f, indent=2, ensure_ascii=False)
+    print(f"\n  💾 Phrases saved to: {filepath}")
+    return filepath
+
+
+# ──────────────────────────────────────────────
+# Stage 2: Create Avatar Videos (Azure Batch)
+# ──────────────────────────────────────────────
+
+def build_azure_headers(subscription_key: str) -> dict:
+    """Build headers for Azure REST API calls."""
+    return {
+        "Ocp-Apim-Subscription-Key": subscription_key,
+        "Content-Type": "application/json",
+    }
+
+
+def get_azure_endpoint(region: str) -> str:
+    """Build the Azure TTS Avatar API base URL."""
+    return f"https://{region}.api.cognitive.microsoft.com"
+
+
+def submit_avatar_job(
+    endpoint: str,
+    headers: dict,
+    job_id: str,
+    text: str,
+    avatar_character: str,
+    avatar_style: str,
+    voice: str,
+) -> bool:
+    """
+    Submit a single batch avatar synthesis job.
+    Returns True if submission was successful.
+    """
+    url = f"{endpoint}/avatar/batchsyntheses/{job_id}?api-version={AZURE_API_VERSION}"
+
+    payload = {
+        "inputKind": "PlainText",
+        "synthesisConfig": {
+            "voice": voice,
+        },
+        "avatarConfig": {
+            "talkingAvatarCharacter": avatar_character,
+            "talkingAvatarStyle": avatar_style,
+            "videoFormat": "mp4",
+        },
+        "inputs": [
+            {"content": text}
+        ],
+    }
+
+    response = requests.put(url, json=payload, headers=headers)
+
+    if response.status_code in (200, 201):
+        print(f"    ✅ Job submitted: {job_id}")
+        return True
+    else:
+        print(f"    ❌ Job submission failed ({response.status_code}): {response.text[:300]}")
+        return False
+
+
+def poll_job_status(
+    endpoint: str,
+    headers: dict,
+    job_id: str,
+    poll_interval: int = DEFAULT_POLL_INTERVAL,
+    max_wait: int = 600,
+) -> dict | None:
+    """
+    Poll an avatar synthesis job until it completes.
+    Returns the job result dict on success, None on failure.
+    """
+    url = f"{endpoint}/avatar/batchsyntheses/{job_id}?api-version={AZURE_API_VERSION}"
+    elapsed = 0
+
+    while elapsed < max_wait:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"    ⚠ Poll error ({response.status_code}): {response.text[:200]}")
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            continue
+
+        data = response.json()
+        status = data.get("status", "Unknown")
+
+        if status == "Succeeded":
+            print(f"    ✅ Job {job_id} completed!")
+            return data
+        elif status == "Failed":
+            error = data.get("properties", {}).get("error", {})
+            print(f"    ❌ Job {job_id} failed: {error}")
+            return None
+        else:
+            print(f"    ⏳ Job {job_id} status: {status} (waited {elapsed}s)")
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    print(f"    ⏰ Job {job_id} timed out after {max_wait}s")
+    return None
+
+
+def create_avatar_videos(
+    phrases: list[dict],
+    avatar_character: str,
+    avatar_style: str,
+    voice: str,
+    mode: str,
+    poll_interval: int,
+) -> list[dict]:
+    """
+    Submit avatar synthesis jobs for all phrases and wait for completion.
+
+    Args:
+        phrases: List of phrase dicts with 'category' and 'phrase' keys
+        mode: 'individual' (one video per phrase) or 'combined' (all in one)
+        
+    Returns:
+        List of dicts with job results and download info
+    """
+    speech_key = os.getenv("AZURE_SPEECH_KEY")
+    speech_region = os.getenv("AZURE_SPEECH_REGION")
+
+    if not speech_key or not speech_region:
+        print("\n  ❌ Missing Azure credentials!")
+        print("     Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
+        sys.exit(1)
+
+    endpoint = get_azure_endpoint(speech_region)
+    headers = build_azure_headers(speech_key)
+
+    print(f"\n{'='*60}")
+    print(f"  STAGE 2: Creating Avatar Videos via Azure Batch Synthesis")
+    print(f"{'='*60}")
+    print(f"  Avatar: {avatar_character} ({avatar_style})")
+    print(f"  Voice:  {voice}")
+    print(f"  Mode:   {mode}")
+    print()
+
+    jobs = []
+
+    if mode == "combined":
+        # Combine all phrases into a single text block
+        combined_text = " ... ".join(p["phrase"] for p in phrases)
+        job_id = f"avatar-combined-{uuid.uuid4().hex[:8]}"
+        print(f"  📤 Submitting combined job ({len(phrases)} phrases)...")
+
+        if submit_avatar_job(endpoint, headers, job_id, combined_text, avatar_character, avatar_style, voice):
+            jobs.append({
+                "job_id": job_id,
+                "category": "combined",
+                "phrase_count": len(phrases),
+                "text_preview": combined_text[:100],
+            })
+    else:
+        # One video per phrase
+        for i, phrase_data in enumerate(phrases, 1):
+            job_id = f"avatar-{phrase_data['category']}-{uuid.uuid4().hex[:8]}"
+            print(f"  📤 [{i}/{len(phrases)}] Submitting: {phrase_data['phrase'][:60]}...")
+
+            if submit_avatar_job(
+                endpoint, headers, job_id,
+                phrase_data["phrase"],
+                avatar_character, avatar_style, voice,
+            ):
+                jobs.append({
+                    "job_id": job_id,
+                    "category": phrase_data["category"],
+                    "phrase": phrase_data["phrase"],
+                    "index": i,
+                })
+
+            # Small delay between submissions to avoid rate limiting
+            if i < len(phrases):
+                time.sleep(1)
+
+    # Poll all jobs for completion
+    print(f"\n  ⏳ Waiting for {len(jobs)} job(s) to complete...\n")
+    results = []
+
+    for job in jobs:
+        result = poll_job_status(endpoint, headers, job["job_id"], poll_interval)
+        if result:
+            # Extract the download URL from the result
+            download_url = result.get("outputs", {}).get("result", "")
+            job["download_url"] = download_url
+            job["status"] = "Succeeded"
+            results.append(job)
+        else:
+            job["status"] = "Failed"
+            results.append(job)
+
+    succeeded = sum(1 for r in results if r["status"] == "Succeeded")
+    print(f"\n  📊 Results: {succeeded}/{len(results)} jobs succeeded")
+
+    return results
+
+
+# ──────────────────────────────────────────────
+# Stage 3: Download Videos
+# ──────────────────────────────────────────────
+
+def download_videos(results: list[dict], output_dir: Path) -> list[Path]:
+    """
+    Download completed avatar videos to the output directory.
+
+    Returns list of downloaded file paths.
+    """
+    print(f"\n{'='*60}")
+    print(f"  STAGE 3: Downloading Videos")
+    print(f"{'='*60}")
+    print(f"  Output directory: {output_dir}\n")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = []
+
+    for job in results:
+        if job["status"] != "Succeeded" or not job.get("download_url"):
+            print(f"  ⏭ Skipping {job['job_id']} (status: {job['status']})")
+            continue
+
+        # Build a descriptive filename
+        if job.get("category") == "combined":
+            filename = "all_phrases_combined.mp4"
+        else:
+            index = job.get("index", 0)
+            category = re.sub(r'[^a-z0-9_]', '_', job.get("category", "unknown").lower())
+            filename = f"phrase_{index:02d}_{category}.mp4"
+
+        filepath = output_dir / filename
+        print(f"  📥 Downloading: {filename}...")
+
+        try:
+            response = requests.get(job["download_url"], stream=True)
+            response.raise_for_status()
+
+            with open(filepath, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            size_mb = filepath.stat().st_size / (1024 * 1024)
+            print(f"    ✅ Saved: {filepath} ({size_mb:.1f} MB)")
+            downloaded.append(filepath)
+
+        except Exception as e:
+            print(f"    ❌ Download failed: {e}")
+
+    return downloaded
+
+
+# ──────────────────────────────────────────────
+# Main Pipeline
+# ──────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Automated AI Colleague Avatar Video Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python avatar_pipeline.py                        # Full pipeline, 10 phrases
+  python avatar_pipeline.py --num-phrases 3        # Only 3 phrases
+  python avatar_pipeline.py --dry-run              # Phrases only, no Azure
+  python avatar_pipeline.py --mode combined        # All phrases in one video
+  python avatar_pipeline.py --output-dir ~/Videos  # Custom output folder
+        """,
+    )
+
+    parser.add_argument(
+        "--llm", type=str, choices=["gemini", "haiku"], default="haiku",
+        help="Which LLM to use for phrase generation (default: gemini)",
+    )
+    parser.add_argument(
+        "--num-phrases", type=int, default=DEFAULT_NUM_PHRASES,
+        choices=range(1, 11), metavar="N",
+        help="Number of phrases to generate (1-10, default: 10)",
+    )
+    parser.add_argument(
+        "--avatar-character", type=str, default=DEFAULT_AVATAR_CHARACTER,
+        help=f"Azure avatar character name (default: {DEFAULT_AVATAR_CHARACTER})",
+    )
+    parser.add_argument(
+        "--avatar-style", type=str, default=DEFAULT_AVATAR_STYLE,
+        help=f"Avatar style (default: {DEFAULT_AVATAR_STYLE})",
+    )
+    parser.add_argument(
+        "--voice", type=str, default=DEFAULT_VOICE,
+        help=f"Azure TTS voice name (default: {DEFAULT_VOICE})",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory to save videos (default: ./avatar_videos)",
+    )
+    parser.add_argument(
+        "--mode", type=str, choices=["individual", "combined"], default="individual",
+        help="'individual' = one video per phrase, 'combined' = all in one video (default: individual)",
+    )
+    parser.add_argument(
+        "--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL,
+        help=f"Seconds between Azure status polls (default: {DEFAULT_POLL_INTERVAL})",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Only generate phrases (skip Azure avatar creation and download)",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Run the full avatar pipeline."""
+    # Load environment variables from .env file
+    load_dotenv()
+
+    args = parse_args()
+
+    print("\n" + "🤖" * 30)
+    print("  AI Colleague Avatar Video Pipeline")
+    print("🤖" * 30)
+    print(f"\n  Config:")
+    print(f"    LLM:       {args.llm}")
+    print(f"    Phrases:   {args.num_phrases}")
+    print(f"    Avatar:    {args.avatar_character} ({args.avatar_style})")
+    print(f"    Voice:     {args.voice}")
+    print(f"    Mode:      {args.mode}")
+    print(f"    Output:    {args.output_dir}")
+    print(f"    Dry run:   {args.dry_run}")
+
+    # ── Stage 1: Generate phrases ──
+    phrases = generate_phrases(args.num_phrases, llm=args.llm)
+    save_phrases(phrases, args.output_dir)
+
+    if args.dry_run:
+        print(f"\n  🏁 Dry run complete! Phrases saved to {args.output_dir}/phrases.json")
+        print(f"     Re-run without --dry-run to create avatar videos.\n")
+        return
+
+    # ── Stage 2: Create avatar videos ──
+    results = create_avatar_videos(
+        phrases=phrases,
+        avatar_character=args.avatar_character,
+        avatar_style=args.avatar_style,
+        voice=args.voice,
+        mode=args.mode,
+        poll_interval=args.poll_interval,
+    )
+
+    # ── Stage 3: Download videos ──
+    succeeded_jobs = [r for r in results if r["status"] == "Succeeded"]
+    if not succeeded_jobs:
+        print("\n  ❌ No videos were successfully generated. Check Azure logs above.")
+        sys.exit(1)
+
+    downloaded = download_videos(results, args.output_dir)
+
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print(f"  ✅ PIPELINE COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Phrases generated:  {len(phrases)}")
+    print(f"  Videos created:     {len(succeeded_jobs)}")
+    print(f"  Videos downloaded:  {len(downloaded)}")
+    print(f"  Output directory:   {args.output_dir}")
+    print(f"\n  Files:")
+    for fp in downloaded:
+        print(f"    📹 {fp.name}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
