@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, AnthropicFoundry
 from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────
@@ -40,7 +40,7 @@ DEFAULT_OUTPUT_DIR = Path(__file__).parent / "avatar_videos"
 DEFAULT_POLL_INTERVAL = 10  # seconds
 AZURE_API_VERSION = "2024-08-01"
 
-HAIKU_MODEL = "claude-3-5-haiku-20241022"
+HAIKU_MODEL = "claude-haiku-4-5"
 GEMINI_MODEL = "gemini-2.0-flash"
 
 # ──────────────────────────────────────────────
@@ -114,11 +114,30 @@ def generate_phrases_gemini(num_phrases: int) -> list[dict]:
 
 def generate_phrases_haiku(num_phrases: int) -> list[dict]:
     """
-    Call Claude Haiku to generate common AI virtual colleague phrases.
+    Call Claude Haiku via Azure AI Foundry to generate AI colleague phrases.
 
     Returns a list of dicts: [{"category": "...", "phrase": "..."}, ...]
     """
-    client = Anthropic()
+    # Support both Azure AI Foundry and direct Anthropic API
+    azure_endpoint = os.getenv("AZURE_VOICELIVE_ENDPOINT")
+    azure_api_key = os.getenv("AZURE_VOICELIVE_API_KEY")
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+
+    if azure_endpoint and azure_api_key:
+        # Azure AI Foundry: use the dedicated Foundry client
+        base_url = azure_endpoint.rstrip("/") + "/anthropic"
+        print(f"  Using Azure AI Foundry: {azure_endpoint}")
+        client = AnthropicFoundry(base_url=base_url, api_key=azure_api_key)
+    elif anthropic_key and anthropic_key != "sk-ant-your-key-here":
+        # Direct Anthropic API
+        print(f"  Using direct Anthropic API")
+        client = Anthropic(api_key=anthropic_key)
+    else:
+        print("\n  ❌ Missing credentials for Claude Haiku!")
+        print("     Set AZURE_VOICELIVE_ENDPOINT + AZURE_VOICELIVE_API_KEY in .env")
+        print("     OR set ANTHROPIC_API_KEY for direct Anthropic access.")
+        sys.exit(1)
+
     prompt = _build_phrase_prompt(num_phrases)
 
     message = client.messages.create(
