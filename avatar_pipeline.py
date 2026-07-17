@@ -47,32 +47,60 @@ GEMINI_MODEL = "gemini-2.0-flash"
 # Stage 1: Generate Phrases (Gemini or Haiku)
 # ──────────────────────────────────────────────
 
-def _build_phrase_prompt(num_phrases: int) -> str:
-    """Build the shared prompt for phrase generation."""
-    return f"""You are helping build an AI virtual colleague avatar. 
-Generate exactly {num_phrases} common phrases that an AI virtual colleague would say to users in a professional workplace setting.
+def _build_phrase_prompt(num_phrases: int, topic: str = "", existing_phrases: list[str] | None = None) -> str:
+    """Build the shared prompt for phrase generation.
 
-Cover a variety of categories such as:
+    Args:
+        num_phrases: How many new phrases to generate.
+        topic: Optional topic/scenario to focus on.
+        existing_phrases: Previously generated phrases to avoid repeating.
+    """
+    topic_instruction = ""
+    if topic:
+        topic_instruction = f"""\nFocus specifically on this topic/scenario: \"{topic}\"
+Generate phrases that an AI virtual colleague would say related to this topic."""
+    else:
+        topic_instruction = """\nCover a variety of categories such as:
 - Greetings (morning, afternoon, welcome back)
 - Meeting-related (reminders, joining, wrapping up)
 - Task assistance (offering help, status updates, task completion)
 - Encouragement and motivation
 - Sign-offs and end-of-day messages
-- Casual friendly interactions
+- Casual friendly interactions"""
+
+    # Build deduplication context so the LLM avoids repeating old phrases
+    dedup_instruction = ""
+    if existing_phrases:
+        dedup_list = "\n".join(f"  - \"{p}\"" for p in existing_phrases[:50])  # cap at 50 to fit context
+        dedup_instruction = f"""\n\nIMPORTANT — The following phrases have ALREADY been generated. Do NOT repeat or closely paraphrase any of them:
+{dedup_list}
+
+Generate completely NEW and DIFFERENT phrases."""
+
+    return f"""You are helping build an AI virtual colleague avatar. 
+Generate exactly {num_phrases} UNIQUE phrases that an AI virtual colleague would say to users in a professional workplace setting.
+{topic_instruction}
 
 Requirements:
 - Each phrase should be 1-3 sentences long
 - Sound natural, warm, and professional — not robotic
 - Suitable for text-to-speech avatar video
+- Each phrase must be DIFFERENT from the others — no repetition
+- Be creative and varied in tone and content
 
-Return ONLY a valid JSON array with objects having "category" and "phrase" keys.
+For each phrase, also indicate the gesture level:
+- "HM" = hand movement (expressive, gesturing)
+- "LBHM" = little bit hand movement (subtle gestures)
+- "NHM" = no hand movement (still/calm delivery)
+
+Return ONLY a valid JSON array with objects having "category", "phrase", and "gesture" keys.
 Example format:
 [
-  {{"category": "greeting", "phrase": "Good morning! I hope you had a great start to your day. Let me know if there's anything I can help you with."}},
-  {{"category": "meeting", "phrase": "Just a friendly reminder — your team standup starts in 10 minutes. I've got your notes ready if you need them."}}
+  {{"category": "greeting", "phrase": "Good morning! I hope you had a great start to your day. Let me know if there's anything I can help you with.", "gesture": "LBHM"}},
+  {{"category": "meeting", "phrase": "Just a friendly reminder — your team standup starts in 10 minutes. I've got your notes ready if you need them.", "gesture": "HM"}}
 ]
-
-Generate exactly {num_phrases} phrases. Return ONLY the JSON array, no extra text."""
+{dedup_instruction}
+Generate exactly {num_phrases} UNIQUE phrases. Return ONLY the JSON array, no extra text."""
 
 
 def _parse_phrases(raw_text: str, source: str) -> list[dict]:
@@ -85,11 +113,11 @@ def _parse_phrases(raw_text: str, source: str) -> list[dict]:
     return json.loads(json_match.group())
 
 
-def generate_phrases_gemini(num_phrases: int) -> list[dict]:
+def generate_phrases_gemini(num_phrases: int, topic: str = "", existing_phrases: list[str] | None = None) -> list[dict]:
     """
     Call Google Gemini to generate common AI virtual colleague phrases.
 
-    Returns a list of dicts: [{"category": "...", "phrase": "..."}, ...]
+    Returns a list of dicts: [{"category": "...", "phrase": "...", "gesture": "..."}, ...]
     """
     from google import genai
 
@@ -100,7 +128,7 @@ def generate_phrases_gemini(num_phrases: int) -> list[dict]:
         sys.exit(1)
 
     client = genai.Client(api_key=api_key)
-    prompt = _build_phrase_prompt(num_phrases)
+    prompt = _build_phrase_prompt(num_phrases, topic=topic, existing_phrases=existing_phrases)
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
@@ -112,11 +140,11 @@ def generate_phrases_gemini(num_phrases: int) -> list[dict]:
     return phrases
 
 
-def generate_phrases_haiku(num_phrases: int) -> list[dict]:
+def generate_phrases_haiku(num_phrases: int, topic: str = "", existing_phrases: list[str] | None = None) -> list[dict]:
     """
     Call Claude Haiku via Azure AI Foundry to generate AI colleague phrases.
 
-    Returns a list of dicts: [{"category": "...", "phrase": "..."}, ...]
+    Returns a list of dicts: [{"category": "...", "phrase": "...", "gesture": "..."}, ...]
     """
     # Support both Azure AI Foundry and direct Anthropic API
     azure_endpoint = os.getenv("AZURE_VOICELIVE_ENDPOINT")
@@ -125,7 +153,7 @@ def generate_phrases_haiku(num_phrases: int) -> list[dict]:
     # Allow overriding the model/deployment name via env var
     model_name = os.getenv("HAIKU_MODEL_NAME", HAIKU_MODEL)
 
-    prompt = _build_phrase_prompt(num_phrases)
+    prompt = _build_phrase_prompt(num_phrases, topic=topic, existing_phrases=existing_phrases)
 
     if azure_endpoint and azure_api_key:
         # Azure AI Foundry: use direct HTTP request
@@ -199,37 +227,87 @@ def generate_phrases_haiku(num_phrases: int) -> list[dict]:
     return phrases
 
 
-def generate_phrases(num_phrases: int, llm: str = "gemini") -> list[dict]:
+def generate_phrases(num_phrases: int, llm: str = "gemini", topic: str = "", existing_phrases: list[str] | None = None) -> list[dict]:
     """
     Generate phrases using the selected LLM.
 
     Args:
-        num_phrases: Number of phrases to generate (1-10)
+        num_phrases: Number of phrases to generate
         llm: Which LLM to use — 'gemini' or 'haiku'
+        topic: Optional topic/scenario to focus phrase generation on
+        existing_phrases: Previously generated phrases to avoid repeating
     """
     print(f"\n{'='*60}")
     print(f"  STAGE 1: Generating {num_phrases} phrases with {llm.capitalize()}")
+    if topic:
+        print(f"  Topic: {topic}")
+    if existing_phrases:
+        print(f"  Avoiding {len(existing_phrases)} existing phrases")
     print(f"{'='*60}\n")
 
     if llm == "haiku":
-        phrases = generate_phrases_haiku(num_phrases)
+        phrases = generate_phrases_haiku(num_phrases, topic=topic, existing_phrases=existing_phrases)
     else:
-        phrases = generate_phrases_gemini(num_phrases)
+        phrases = generate_phrases_gemini(num_phrases, topic=topic, existing_phrases=existing_phrases)
 
     print(f"  ✅ Generated {len(phrases)} phrases:\n")
     for i, p in enumerate(phrases, 1):
-        print(f"  {i:>2}. [{p['category']}] {p['phrase'][:80]}{'...' if len(p['phrase']) > 80 else ''}")
+        gesture = p.get('gesture', 'NHM')
+        print(f"  {i:>2}. [{p['category']}] [{gesture}] {p['phrase'][:75]}{'...' if len(p['phrase']) > 75 else ''}")
 
     return phrases
 
 
-def save_phrases(phrases: list[dict], output_dir: Path) -> Path:
-    """Save generated phrases to a JSON file for traceability."""
+def load_existing_phrases(output_dir: Path) -> list[dict]:
+    """Load previously generated phrases from phrases.json if it exists."""
+    filepath = output_dir / "phrases.json"
+    if filepath.exists():
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, list):
+                print(f"  📂 Loaded {len(existing)} existing phrases from {filepath}")
+                return existing
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"  ⚠ Could not load existing phrases: {e}")
+    return []
+
+
+def save_phrases(phrases: list[dict], output_dir: Path, merge_existing: bool = True) -> Path:
+    """Save generated phrases to a JSON file, merging with existing ones.
+
+    Args:
+        phrases: New phrases to save.
+        output_dir: Directory containing phrases.json.
+        merge_existing: If True, append to existing phrases (dedup by phrase text).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / "phrases.json"
+
+    all_phrases = []
+    if merge_existing and filepath.exists():
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, list):
+                all_phrases = existing
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Deduplicate: keep existing phrases, add only truly new ones
+    existing_texts = {p.get("phrase", "").strip().lower() for p in all_phrases}
+    new_count = 0
+    for p in phrases:
+        phrase_key = p.get("phrase", "").strip().lower()
+        if phrase_key and phrase_key not in existing_texts:
+            all_phrases.append(p)
+            existing_texts.add(phrase_key)
+            new_count += 1
+
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(phrases, f, indent=2, ensure_ascii=False)
+        json.dump(all_phrases, f, indent=2, ensure_ascii=False)
     print(f"\n  💾 Phrases saved to: {filepath}")
+    print(f"     Total: {len(all_phrases)} ({new_count} new, {len(all_phrases) - new_count} existing)")
     return filepath
 
 
@@ -250,6 +328,21 @@ def get_azure_endpoint(region: str) -> str:
     return f"https://{region}.api.cognitive.microsoft.com"
 
 
+def _wrap_ssml(text: str, voice: str) -> str:
+    """Wrap plain text in SSML tags for Azure TTS Avatar.
+
+    Using SSML ensures the audio track is properly generated and embedded
+    in the output video (PlainText mode has known issues with silent output).
+    """
+    # Escape XML special characters in the text
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        f"<speak version='1.0' xml:lang='en-US'>"
+        f"<voice name='{voice}'>{escaped}</voice>"
+        f"</speak>"
+    )
+
+
 def submit_avatar_job(
     endpoint: str,
     headers: dict,
@@ -265,37 +358,33 @@ def submit_avatar_job(
     """
     url = f"{endpoint}/avatar/batchsyntheses/{job_id}?api-version={AZURE_API_VERSION}"
 
-    # Use SSML to ensure voice is properly linked to audio
-    ssml_text = (
-        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-        f'xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">'
-        f'<voice name="{voice}">'
-        f'{text}'
-        f'</voice></speak>'
-    )
+    # Use SSML for reliable audio output (PlainText can produce silent videos)
+    ssml_content = _wrap_ssml(text, voice)
 
     payload = {
         "inputKind": "SSML",
-        "synthesisConfig": {
-            "voice": voice,
-        },
         "avatarConfig": {
             "talkingAvatarCharacter": avatar_character,
             "talkingAvatarStyle": avatar_style,
             "videoFormat": "mp4",
+            "videoCodec": "hevc",
+            "subtitleType": "soft_embedded",
+            "bitrateKbps": 2000,
+            "customized": False,
         },
         "inputs": [
-            {"content": ssml_text}
+            {"content": ssml_content}
         ],
     }
 
+    print(f"    📋 Payload: inputKind=SSML, voice={voice}, codec=hevc, bitrate=2000kbps")
     response = requests.put(url, json=payload, headers=headers)
 
     if response.status_code in (200, 201):
         print(f"    ✅ Job submitted: {job_id}")
         return True
     else:
-        print(f"    ❌ Job submission failed ({response.status_code}): {response.text[:300]}")
+        print(f"    ❌ Job submission failed ({response.status_code}): {response.text[:500]}")
         return False
 
 
@@ -414,7 +503,8 @@ def create_avatar_videos(
         # One video per phrase
         for i, phrase_data in enumerate(phrases, 1):
             job_id = f"avatar-{phrase_data['category']}-{uuid.uuid4().hex[:8]}"
-            print(f"  📤 [{i}/{len(phrases)}] Submitting: {phrase_data['phrase'][:60]}...")
+            gesture = phrase_data.get("gesture", "NHM")
+            print(f"  📤 [{i}/{len(phrases)}] [{gesture}] Submitting: {phrase_data['phrase'][:55]}...")
 
             if submit_avatar_job(
                 endpoint, headers, job_id,
@@ -425,6 +515,7 @@ def create_avatar_videos(
                     "job_id": job_id,
                     "category": phrase_data["category"],
                     "phrase": phrase_data["phrase"],
+                    "gesture": gesture,
                     "index": i,
                 })
 
@@ -477,15 +568,27 @@ def download_videos(results: list[dict], output_dir: Path) -> list[Path]:
             print(f"  ⏭ Skipping {job['job_id']} (status: {job['status']})")
             continue
 
-        # Build a descriptive filename
+        # Build filename from phrase text + gesture suffix
         if job.get("category") == "combined":
             filename = "all_phrases_combined.mp4"
         else:
-            index = job.get("index", 0)
-            category = re.sub(r'[^a-z0-9_]', '_', job.get("category", "unknown").lower())
-            filename = f"phrase_{index:02d}_{category}.mp4"
+            phrase_text = job.get("phrase", "unknown")
+            gesture = job.get("gesture", "NHM")
+
+            # Clean phrase for filename: keep first ~60 chars, make filesystem-safe
+            clean_phrase = phrase_text[:60].strip()
+            clean_phrase = re.sub(r'[<>:"/\\|?*]', '', clean_phrase)
+            clean_phrase = clean_phrase.rstrip('.')
+
+            filename = f"{clean_phrase}-{gesture}.mp4"
 
         filepath = output_dir / filename
+
+        # Same phrase+gesture = same filename → overwrite (re-download fresh)
+        # Different phrase = different filename → creates new file, never deletes old ones
+        if filepath.exists():
+            print(f"  🔄 Overwriting (same phrase): {filename}")
+
         print(f"  📥 Downloading: {filename}...")
 
         try:
@@ -520,6 +623,8 @@ Examples:
   python avatar_pipeline.py                        # Full pipeline, 10 phrases
   python avatar_pipeline.py --num-phrases 3        # Only 3 phrases
   python avatar_pipeline.py --dry-run              # Phrases only, no Azure
+  python avatar_pipeline.py --topic "greetings"    # Generate greeting phrases only
+  python avatar_pipeline.py --topic "helping users with reports"  # Custom topic
   python avatar_pipeline.py --mode combined        # All phrases in one video
   python avatar_pipeline.py --output-dir ~/Videos  # Custom output folder
         """,
@@ -531,8 +636,12 @@ Examples:
     )
     parser.add_argument(
         "--num-phrases", type=int, default=DEFAULT_NUM_PHRASES,
-        choices=range(1, 11), metavar="N",
-        help="Number of phrases to generate (1-10, default: 10)",
+        metavar="N",
+        help="Number of phrases to generate (default: 10, no upper limit)",
+    )
+    parser.add_argument(
+        "--topic", type=str, default="",
+        help="Topic or scenario for phrase generation (e.g., 'greetings', 'helping with reports')",
     )
     parser.add_argument(
         "--avatar-character", type=str, default=DEFAULT_AVATAR_CHARACTER,
@@ -606,14 +715,24 @@ def main():
     print(f"\n  Config:")
     print(f"    LLM:       {args.llm}")
     print(f"    Phrases:   {args.num_phrases}")
+    print(f"    Topic:     {args.topic or '(general)'}")
     print(f"    Avatar:    {args.avatar_character} ({args.avatar_style})")
     print(f"    Voice:     {args.voice}")
     print(f"    Mode:      {args.mode}")
     print(f"    Output:    {args.output_dir}")
     print(f"    Dry run:   {args.dry_run}")
 
+    # ── Load existing phrases for deduplication ──
+    existing_data = load_existing_phrases(args.output_dir)
+    existing_phrase_texts = [p.get("phrase", "") for p in existing_data if p.get("phrase")]
+
     # ── Stage 1: Generate phrases ──
-    phrases = generate_phrases(args.num_phrases, llm=args.llm)
+    phrases = generate_phrases(
+        args.num_phrases,
+        llm=args.llm,
+        topic=args.topic,
+        existing_phrases=existing_phrase_texts if existing_phrase_texts else None,
+    )
     save_phrases(phrases, args.output_dir)
 
     if args.dry_run:
