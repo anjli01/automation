@@ -327,14 +327,31 @@ def create_avatar_videos(
         List of dicts with job results and download info
     """
     speech_key = os.getenv("AZURE_SPEECH_KEY")
+    speech_endpoint = os.getenv("AZURE_SPEECH_ENDPOINT")
     speech_region = os.getenv("AZURE_SPEECH_REGION")
 
-    if not speech_key or not speech_region:
-        print("\n  ❌ Missing Azure credentials!")
-        print("     Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
+    if not speech_key:
+        # Fallback: use same key as Azure Foundry if from same resource
+        speech_key = os.getenv("AZURE_VOICELIVE_API_KEY")
+
+    if not speech_key:
+        print("\n  ❌ Missing Azure Speech key!")
+        print("     Set AZURE_SPEECH_KEY (or AZURE_VOICELIVE_API_KEY) in your .env file.")
         sys.exit(1)
 
-    endpoint = get_azure_endpoint(speech_region)
+    if speech_endpoint:
+        # Use custom endpoint directly (for Azure AI Services resources)
+        endpoint = speech_endpoint.rstrip("/")
+        print(f"  Using Speech endpoint: {endpoint}")
+    elif speech_region:
+        # Build from region (for standalone Speech resources)
+        endpoint = get_azure_endpoint(speech_region)
+        print(f"  Using Speech region: {speech_region}")
+    else:
+        print("\n  ❌ Missing Azure Speech endpoint!")
+        print("     Set AZURE_SPEECH_ENDPOINT or AZURE_SPEECH_REGION in your .env file.")
+        sys.exit(1)
+
     headers = build_azure_headers(speech_key)
 
     print(f"\n{'='*60}")
