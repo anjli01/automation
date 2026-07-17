@@ -144,9 +144,9 @@ def generate_phrases_haiku(num_phrases: int) -> list[dict]:
 
         # Try different auth header formats (Azure services vary)
         auth_headers_to_try = [
+            {"x-api-key": azure_api_key},
             {"api-key": azure_api_key},
             {"Ocp-Apim-Subscription-Key": azure_api_key},
-            {"x-api-key": azure_api_key},
         ]
 
         response = None
