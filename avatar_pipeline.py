@@ -128,23 +128,47 @@ def generate_phrases_haiku(num_phrases: int) -> list[dict]:
     prompt = _build_phrase_prompt(num_phrases)
 
     if azure_endpoint and azure_api_key:
-        # Azure AI Foundry: use direct HTTP request with correct api-key header
+        # Azure AI Foundry: use direct HTTP request
         url = azure_endpoint.rstrip("/") + "/anthropic/v1/messages"
+        masked_key = azure_api_key[:6] + "..." + azure_api_key[-4:]
         print(f"  Using Azure AI Foundry: {azure_endpoint}")
         print(f"  Model/Deployment: {model_name}")
+        print(f"  API Key: {masked_key}")
+        print(f"  URL: {url}")
 
-        headers = {
-            "api-key": azure_api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
         payload = {
             "model": model_name,
             "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        response = requests.post(url, json=payload, headers=headers)
+        # Try different auth header formats (Azure services vary)
+        auth_headers_to_try = [
+            {"api-key": azure_api_key},
+            {"Ocp-Apim-Subscription-Key": azure_api_key},
+            {"x-api-key": azure_api_key},
+        ]
+
+        response = None
+        for auth_header in auth_headers_to_try:
+            headers = {
+                **auth_header,
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+            }
+            header_name = list(auth_header.keys())[0]
+            print(f"\n  🔑 Trying auth header: {header_name}...")
+            response = requests.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                print(f"    ✅ Success with header: {header_name}")
+                break
+            elif response.status_code == 401:
+                print(f"    ❌ 401 with {header_name} — trying next...")
+                continue
+            else:
+                # Non-auth error, stop trying
+                break
 
         if response.status_code != 200:
             print(f"\n  ❌ Azure AI Foundry request failed ({response.status_code}):")
