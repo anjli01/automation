@@ -276,7 +276,9 @@ def submit_avatar_job(
 
     payload = {
         "inputKind": "SSML",
-        "synthesisConfig": {},
+        "synthesisConfig": {
+            "voice": voice,
+        },
         "avatarConfig": {
             "talkingAvatarCharacter": avatar_character,
             "talkingAvatarStyle": avatar_style,
