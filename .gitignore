@@ -1,0 +1,11 @@
+# Ignore environment files with secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Output videos (optional — remove this line if you want to track videos)
+avatar_videos/*.mp4
+.DS_Store
