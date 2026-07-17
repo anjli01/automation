@@ -265,18 +265,25 @@ def submit_avatar_job(
     """
     url = f"{endpoint}/avatar/batchsyntheses/{job_id}?api-version={AZURE_API_VERSION}"
 
+    # Use SSML to ensure voice is properly linked to audio
+    ssml_text = (
+        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        f'xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">'
+        f'<voice name="{voice}">'
+        f'{text}'
+        f'</voice></speak>'
+    )
+
     payload = {
-        "inputKind": "PlainText",
-        "synthesisConfig": {
-            "voice": voice,
-        },
+        "inputKind": "SSML",
+        "synthesisConfig": {},
         "avatarConfig": {
             "talkingAvatarCharacter": avatar_character,
             "talkingAvatarStyle": avatar_style,
             "videoFormat": "mp4",
         },
         "inputs": [
-            {"content": text}
+            {"content": ssml_text}
         ],
     }
 
